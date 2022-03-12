@@ -4,6 +4,7 @@ import datetime
 from datetime import date
 from unicodedata import decimal
 from dateutil.relativedelta import relativedelta
+import decimal
 from decimal import Decimal
 from bisect import bisect
 import csv
@@ -133,8 +134,10 @@ def simulate_mortgage(loan_amount, interest, date_start, years, amortization):
 def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
     faux_amortization = faux_amortization.quantize(Decimal('1.00'))
     actual_interest_amount = loan_amount * interest / Decimal(12)
-    fund_amount = Decimal(0)
+    fund_shares = 0
+    depot_value = Decimal(0)
     total_paid_interest = Decimal(0)
+    total_paid_tax = Decimal(0)
     total_fund_deposits = Decimal(0)
     paid_amortization = Decimal(0)
 
@@ -142,30 +145,28 @@ def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
     current_date = date(year=date_start.year, month=date_start.month, day=25)
     date_end = date_start + relativedelta(years=years)
 
-    previous_index_price = get_price(date_start)
-
-    fund_amount_at_year_start = {current_year: fund_amount}
+    fund_amount_at_year_start = {current_year: Decimal(0)}
     fund_deposits_first_half = Decimal(0)
     fund_deposits_second_half = Decimal(0)
+    running_tax_deduction = Decimal(0)
 
     #rows = []
     csvfile = open('kf.csv', 'w', newline='')
     writer = csv.writer(csvfile)
     writer.writerow([
         'Date',
-        'Fund growth amt',
-        'Fund growth %',
         'Faux interest',
         'Deposit adjustment',
         'Deposit',
         'Fund value',
         'Total paid interest',
+        'Total paid tax',
         'Total fund deposits',
         'Total paid',
         'Capital minus total paid'
     ])
     while current_date < date_end:
-        #print(current_date)
+        print("%s:" % current_date)
         row = []
         row.append(current_date)
 
@@ -173,75 +174,122 @@ def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
             # Record fund value at start of year and reset accumulation of
             # fund deposits by year half (for taxation calculations)
             current_year = current_date.year
-            index_price_at_year_start = get_price(date(current_year, 1, 1))
-            fund_growth_factor = index_price_at_year_start / previous_index_price
-            new_fund_amount = fund_amount * fund_growth_factor
-            new_fund_amount = new_fund_amount.quantize(Decimal('1.00'))
-            print("Fund at start of %d: %s" % (current_year, new_fund_amount))
-            fund_amount_at_year_start[current_year] = new_fund_amount
+            share_price_at_year_start = get_price(date(current_year, 1, 1))
+            fund_amount = (share_price_at_year_start*fund_shares + depot_value).quantize(Decimal('1.00'))
+            print("Fund at start of %d: %s" % (current_year, fund_amount))
+            fund_amount_at_year_start[current_year] = fund_amount
 
-            fund_deposits_first_half = Decimal(0)
-            fund_deposits_second_half = Decimal(0)
-
-
+        tax_deduction_due_now = Decimal(0)
         # > När dras avkastningsskatten?
         # > Den dras 4 ggr om året, i januari, april, juli och oktober.
         if current_date.month in (1, 4, 7, 10):
-            # Taxation time!
-            print('tax at %s:' % current_date)
-            applicable_interest_rate_date = date(current_date.year - 2, 11, 30)
-            govt_interest_rate = get_govt_interest_rate(applicable_interest_rate_date)
-            interest_rate_factor = govt_interest_rate + Decimal('0.01')
-            if interest_rate_factor < Decimal('0.0125'):
-                interest_rate_factor = Decimal('0.0125')
-            print('  interest rate: %s' % interest_rate_factor)
-            taxation_fund_amount = fund_amount_at_year_start[current_year]
-            print('  Base fund amount: %s' % taxation_fund_amount)
-            taxation_fund_amount += fund_deposits_first_half
-            taxation_fund_amount += fund_deposits_second_half * Decimal(0.5)
-            print('  Added deposits: %s' % (fund_deposits_first_half + fund_deposits_second_half * Decimal(0.5)))
-            tax = taxation_fund_amount * interest_rate_factor * Decimal('0.3')
-            tax /= Decimal(4)
-            tax = tax.quantize(Decimal('1.00'))
-            print('  amount: %s' % tax)
+            # Predict how much tax we are going to pay at end of this year
+            taxation_year = current_year
+            if current_date.month == 1:
+                taxation_year -= 1
+            print('  Tax deduction calculation:')
+            slr_date = date(taxation_year - 1, 11, 30)
+            slr = get_slr(slr_date)
+            slr_factor = slr + Decimal('0.01')
+            if slr_factor < Decimal('0.0125'):
+                slr_factor = Decimal('0.0125')
+            print('    SLR factor: %s' % slr_factor)
+            base_taxation_fund_amount = fund_amount_at_year_start[taxation_year]
+            print('    Base fund amount: %s' % base_taxation_fund_amount)
+            taxation_deposits = fund_deposits_first_half + fund_deposits_second_half * Decimal(0.5)
+            print('    Added deposit amount: %s' % taxation_deposits)
+            taxation_fund_amount = base_taxation_fund_amount + taxation_deposits
+            tax = (taxation_fund_amount * slr_factor * Decimal('0.3')).quantize(Decimal('1.00'))
+            print("    Predicted tax at end of year: %s" % tax)
 
+            # Make sure we have deducted at least a proportion of the predicted tax
+            # that corresponds to the how many months have gone on the current
+            # taxation year.
+            if current_date.month == 1:
+                due_tax_factor = Decimal('1.0')
+            elif current_date.month == 10:
+                due_tax_factor = Decimal('0.75')
+            elif current_date.month == 7:
+                due_tax_factor = Decimal('0.5')
+            elif current_date.month == 4:
+                due_tax_factor = Decimal('0.25')
 
+            total_due_now = (tax * due_tax_factor).quantize(Decimal('1.00'))
+            tax_deduction_due_now = total_due_now - running_tax_deduction
+            assert not tax_deduction_due_now.is_signed()
+            print("    Deduct now: %s" % tax_deduction_due_now)
+            print("    Accumulated: %s" % (running_tax_deduction + tax_deduction_due_now))
+            running_tax_deduction += tax_deduction_due_now
 
+            if current_date.month == 1:
+                fund_deposits_first_half = Decimal(0)
+                fund_deposits_second_half = Decimal(0)
+                running_tax_deduction = Decimal(0)
 
-        current_index_price = get_price(current_date)
-        fund_growth_factor = current_index_price / previous_index_price
-        new_fund_amount = fund_amount * fund_growth_factor
-        new_fund_amount = new_fund_amount.quantize(Decimal('1.00'))
-        previous_index_price = current_index_price
-        row.append(new_fund_amount - fund_amount)
-        row.append((fund_growth_factor*Decimal(100) - Decimal(100)).quantize(Decimal('1.000')))
+        current_share_price = get_price(current_date)
 
         faux_interest_amount = (loan_amount*interest/Decimal(12)).quantize(Decimal('1.00'))
-        deposit_penalty = faux_interest_amount - actual_interest_amount
-        fund_deposit = faux_amortization + deposit_penalty
-        fund_amount = new_fund_amount + fund_deposit
-        fund_amount = fund_amount.quantize(Decimal('1.00'))
+        deposit_adjustment = faux_interest_amount - actual_interest_amount
+        # NEXT add funds to depot instead and then use depot value for any decisions made
+        depot_deposit = faux_amortization + deposit_adjustment
+        depot_value += depot_deposit
+
         if current_date.month < 7:
-            fund_deposits_first_half += fund_deposit
+            fund_deposits_first_half += depot_deposit
         else:
-            fund_deposits_second_half += fund_deposit
+            fund_deposits_second_half += depot_deposit
+
+        #fund_deposit = faux_amortization + deposit_adjustment - tax_deduction_due_now
+        print("  Adding to depot: %s" % depot_deposit)
+
+        if tax_deduction_due_now > depot_value:
+            # Not enough money in depot. Need to sell off shares.
+            extra_needed_money = tax_deduction_due_now - depot_value
+            shares_to_sell = extra_needed_money / current_share_price
+            shares_to_sell = shares_to_sell.to_integral_value(rounding=decimal.ROUND_CEILING)
+            fund_shares -= shares_to_sell
+            sold_shares_value = (shares_to_sell*current_share_price).quantize(Decimal('1.00'))
+            depot_value += sold_shares_value
+            print("  Sell %s shares for %s to pay for tax; depot value now %s" % (shares_to_sell, sold_shares_value, depot_value))
+
+        if not tax_deduction_due_now.is_zero():
+            depot_value -= tax_deduction_due_now
+            print("  Deducting tax from depot; value now %s" % depot_value)
+
+        shares_to_buy = depot_value/current_share_price
+        shares_to_buy = shares_to_buy.to_integral_value(rounding=decimal.ROUND_FLOOR)
+        purchase_value = (shares_to_buy*current_share_price).quantize(Decimal('1.00'))
+        if not shares_to_buy.is_zero():
+            fund_shares += shares_to_buy
+            depot_value -= purchase_value
+            print("  Buy %s shares for %s" % (shares_to_buy, purchase_value))
+            print("  Depot value: %s" % depot_value)
+
+        new_fund_value = (fund_shares*current_share_price).quantize(Decimal('1.00'))
+
         loan_amount -= faux_amortization
         paid_amortization += faux_amortization
 
         row.append(faux_interest_amount)
-        row.append(deposit_penalty)
-        row.append(fund_deposit)
-        row.append(fund_amount)
+        row.append(deposit_adjustment)
+        row.append(depot_deposit)
+        row.append(new_fund_value)
+        print("  Fund value after transactions: %s" % new_fund_value)
+        print("  Depot value: %s" % depot_value)
 
         total_paid_interest += actual_interest_amount
         row.append(total_paid_interest)
-        total_fund_deposits += fund_deposit
+        total_paid_tax += tax_deduction_due_now
+        row.append(total_paid_tax)
+        total_fund_deposits += depot_deposit
+        # TODO probably need to track paid tax here also
         row.append(total_fund_deposits)
         total_paid = total_paid_interest + total_fund_deposits
         row.append(total_paid)
-        row.append(fund_amount - total_paid - loan_amount)
+        row.append(new_fund_value - total_paid - loan_amount)
         writer.writerow(row)
 
+        previous_row_date = current_date
         current_date += relativedelta(months=1)
 
     csvfile.close()
@@ -262,7 +310,7 @@ def get_govt_interest_rate_broken_bisect(date):
     assert pos > 0
     return g_govt_interest_rates[pos][1] / Decimal(100)
 
-def get_govt_interest_rate(date):
+def get_slr(date):
     for (i, (d, rate)) in enumerate(g_govt_interest_rates):
         if d > date:
             return g_govt_interest_rates[i-1][1] / Decimal(100)
