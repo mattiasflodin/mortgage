@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 import re
 import datetime
-from datetime import date
+import calendar
+from datetime import date, timedelta
 from unicodedata import decimal
 from dateutil.relativedelta import relativedelta
 import decimal
@@ -32,6 +33,7 @@ def main():
     start_date = date(1990, 3, 1)
     simulate_mortgage(loan, interest, start_date, years, amortization)
     simulate_kf(loan, interest, start_date, years, amortization)
+    simulate_fund_account(loan, interest, start_date, 30, amortization)
 
 def read_prices():
     date_re = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
@@ -130,6 +132,156 @@ def simulate_mortgage(loan_amount, interest, date_start, years, amortization):
         current_date += relativedelta(months=1)
 
     csvfile.close()
+
+class Mortgage:
+    def __init__(self, amount, interest_rate):
+        self.amount = amount
+        self.interest_rate = interest_rate
+
+    def amortize(self, amount):
+        self.amount -= amount
+
+    def monthly_interest(self):
+        return (self.amount * self.interest_rate/Decimal(12)).quantize(Decimal('1.00'))
+
+class FundAccount:
+    def __init__(self, open_date):
+        self.depot_value = Decimal(0)
+        self.shares = 0
+        self.current_date = open_date
+
+    def move_forward_to_day(self, day):
+        if self.current_date.day > day:
+            self.current_date = self.current_date.replace(day = 1)
+            self.current_date += timedelta(calendar.month)
+
+        days_in_month = calendar.monthrange(self.current_date.year, self.current_date.month)[1]
+        while days_in_month < day:
+            self.current_date += timedelta(months=1)
+            days_in_month = calendar.monthrange(self.current_date.year, self.current_date.month)[1]
+
+        self.current_date = self.current_date.replace(day = day)
+
+    def next_month(self):
+        self.current_date = self.current_date.replace(day = 1)
+        self.current_date += relativedelta(months=1)
+
+    def current_value(self):
+        return self.current_share_price()*self.shares
+
+    def current_share_price(self):
+        return get_price(self.current_date)
+
+    def deposit(self, amount):
+        assert not amount.is_signed()
+        self.depot_value += amount
+
+    def deduct_tax(self, amount):
+        assert amount <= self.depot_value
+        self.depot_value -= amount
+
+    def buy_shares(self, count):
+        assert count >= 0
+        purchase_amount = self.current_share_price()*count
+        assert self.depot_value >= purchase_amount
+        self.shares += count
+        self.depot_value -= purchase_amount
+
+
+def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_amortization):
+    account = FundAccount(date_start)
+    faux_mortgage = Mortgage(loan_amount, interest_rate)
+    faux_amortization = faux_amortization.quantize(Decimal('1.00'))
+    actual_monthly_interest = loan_amount * interest_rate / Decimal(12)
+
+    end_date = date_start + relativedelta(years=years)
+
+    pending_tax_next = Decimal(0)
+    pending_tax_current = Decimal(0)
+
+    total_fund_deposit = Decimal(0)
+    total_paid_interest = Decimal(0)
+    total_paid_tax = Decimal(0)
+
+    csvfile = open('fund_account.csv', 'w', newline='')
+    writer = csv.writer(csvfile)
+    writer.writerow([
+        'Date',
+        'Faux interest',
+        'Deposit adjustment',
+        'Deposit',
+        'Fund value',
+        'Total paid interest',
+        'Total paid tax',
+        'Total fund deposits',
+        'Total paid',
+        'Capital minus total paid',
+        'Shares'
+    ])
+
+    while account.current_date < end_date:
+        if account.current_date.month == 1 and account.current_date.day == 1:
+            assert pending_tax_next.is_zero()
+            standard_income = account.current_value() * Decimal('0.004')
+            pending_tax_next = standard_income * Decimal('0.3')
+            pending_tax_next = pending_tax_next.quantize(Decimal('1.00'))
+            print("Standard income tax next year: %s" % pending_tax_next)
+
+        account.move_forward_to_day(25)
+        row = []
+        print(account.current_date)
+        row.append(account.current_date)
+
+        if account.current_date.month == 4:
+            if not pending_tax_current.is_zero():
+                print("  paying tax: %s" % pending_tax_current)
+                print("    (current depot value: %s)" % account.depot_value)
+                account.deduct_tax(pending_tax_current)
+                total_paid_tax += pending_tax_current
+            pending_tax_current = pending_tax_next
+            pending_tax_next = Decimal(0)
+
+        faux_monthly_interest = faux_mortgage.monthly_interest()
+        row.append(faux_monthly_interest)
+        faux_mortgage.amortize(faux_amortization)
+        deposit_adjustment = actual_monthly_interest - faux_monthly_interest
+        row.append(deposit_adjustment)
+        deposit = faux_amortization - deposit_adjustment
+        account.deposit(deposit)
+        row.append(deposit)
+        print("  deposit: %s" % deposit)
+        print("  depot value: %s" % account.depot_value)
+        print("    (saving %s for tax)" % pending_tax_current)
+        print("  current share price: %s" % account.current_share_price())
+
+
+        available_for_purchase = account.depot_value
+        available_for_purchase -= pending_tax_current
+        if not available_for_purchase.is_signed():
+            shares_to_buy = available_for_purchase/account.current_share_price()
+            shares_to_buy = shares_to_buy.to_integral_value(rounding=decimal.ROUND_FLOOR)
+            account.buy_shares(shares_to_buy)
+            print("  buy %s shares" % shares_to_buy)
+            print("  fund value: %s" % account.current_value())
+
+        row.append(account.current_value())
+
+        total_paid_interest += actual_monthly_interest
+        row.append(total_paid_interest)
+        row.append(total_paid_tax)
+        total_fund_deposit += deposit
+        row.append(total_fund_deposit)
+        total_paid = total_paid_interest + total_fund_deposit
+        row.append(total_paid)
+
+        row.append(account.current_value() - loan_amount - total_paid)
+        row.append(account.shares)
+
+        writer.writerow(row)
+        account.next_month()
+    csvfile.close()
+
+
 
 def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
     faux_amortization = faux_amortization.quantize(Decimal('1.00'))
