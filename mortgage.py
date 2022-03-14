@@ -103,6 +103,9 @@ class Mortgage:
     def monthly_interest(self):
         return (self.amount * self.interest_rate/Decimal(12)).quantize(Decimal('1.00'))
 
+    def clone(self):
+        return Mortgage(self.amount, self.interest_rate)
+
 class BasicFundAccount:
     def __init__(self, open_date):
         self.depot_value = Decimal(0)
@@ -297,6 +300,22 @@ def simulate_mortgage(loan_amount, interest_rate, date_start, years, amortizatio
 
     csvfile.close()
 
+def predict_deposits_until_january(actual_mortgage, faux_mortgage, current_month, amortization):
+    faux_mortgage = faux_mortgage.clone()
+    deposit_sum = Decimal(0)
+    faux_mortgage.amortize(amortization)
+    if current_month == 1:
+        return deposit_sum
+    #print("  predict:")
+    while current_month != 13:
+        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
+        deposit = amortization - deposit_adjustment
+        #print("    %s %s" % (current_month, deposit))
+        deposit_sum += deposit
+        faux_mortgage.amortize(amortization)
+        current_month += 1
+    return deposit_sum
+
 
 def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_amortization):
     account = DirectFundAccount(date_start)
@@ -336,7 +355,15 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
         deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
         deposit = faux_amortization - deposit_adjustment
         account.deposit(deposit)
-        save_for_tax = max(account.pending_tax_next_year, account.due_tax_deduction)
+        #save_for_tax = max(account.pending_tax_next_year, account.due_tax_deduction)
+
+        deposits_before_january = predict_deposits_until_january(actual_mortgage, faux_mortgage,
+            account.current_date.month, faux_amortization)
+        print("  approximate remaining deposit before tax: %s" % deposits_before_january)
+        save_for_tax = Decimal(0)
+        if deposits_before_january < account.pending_tax_next_year:
+            save_for_tax = max(account.pending_tax_next_year, account.due_tax_deduction)
+
         print("  depot value: %s" % account.depot_value)
         print("    (saving %s for tax)" % save_for_tax)
         print("  current share price: %s" % account.current_share_price())
