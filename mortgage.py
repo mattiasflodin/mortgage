@@ -92,47 +92,6 @@ def read_government_interest_rate():
     return interest_rates
 
 
-def simulate_mortgage(loan_amount, interest, date_start, years, amortization):
-    amortization = amortization.quantize(Decimal('1.00'))
-
-    csvfile = open('mortgage.csv', 'w', newline='')
-    writer = csv.writer(csvfile)
-    writer.writerow([
-        'Date',
-        'Interest',
-        'Debt',
-        'Total paid interest',
-        'Total amortization',
-        'Total paid',
-        'Capital minus total paid'
-    ])
-
-    current_date = date(year=date_start.year, month=date_start.month, day=25)
-    date_end = date_start + relativedelta(years=years)
-    total_paid_interest = Decimal(0)
-    total_paid_amortization = Decimal(0)
-    while current_date < date_end:
-        row = []
-        row.append(current_date)
-
-        interest_amount = (loan_amount * interest / Decimal(12)).quantize(Decimal('1.00'))
-        row.append(interest_amount)
-        loan_amount -= amortization
-        row.append(loan_amount)
-
-        total_paid_interest += interest_amount
-        total_paid_amortization += amortization
-        row.append(total_paid_interest)
-        row.append(total_paid_amortization)
-        total_paid = total_paid_interest + total_paid_amortization
-        row.append(total_paid)
-        row.append(loan_amount.copy_negate() - total_paid)
-
-        writer.writerow(row)
-        current_date += relativedelta(months=1)
-
-    csvfile.close()
-
 class Mortgage:
     def __init__(self, amount, interest_rate):
         self.amount = amount
@@ -144,20 +103,26 @@ class Mortgage:
     def monthly_interest(self):
         return (self.amount * self.interest_rate/Decimal(12)).quantize(Decimal('1.00'))
 
-class FundAccount:
+class BasicFundAccount:
     def __init__(self, open_date):
         self.depot_value = Decimal(0)
         self.shares = 0
         self.current_date = open_date
+        self.due_tax_deduction = Decimal(0)
+        self.purchase_value = Decimal(0)
+        self.realized_profits = Decimal(0)
+        self.total_deposited = Decimal(0)
 
     def move_forward_to_day(self, day):
         if self.current_date.day > day:
             self.current_date = self.current_date.replace(day = 1)
-            self.current_date += timedelta(calendar.month)
+            self.current_date += timedelta(months=1)
+            self._enter_month(self.current_date.month)
 
         days_in_month = calendar.monthrange(self.current_date.year, self.current_date.month)[1]
         while days_in_month < day:
             self.current_date += timedelta(months=1)
+            self._enter_month(self.current_date.month)
             days_in_month = calendar.monthrange(self.current_date.year, self.current_date.month)[1]
 
         self.current_date = self.current_date.replace(day = day)
@@ -165,20 +130,22 @@ class FundAccount:
     def next_month(self):
         self.current_date = self.current_date.replace(day = 1)
         self.current_date += relativedelta(months=1)
+        self._enter_month(self.current_date.month)
 
     def current_value(self):
-        return self.current_share_price()*self.shares
+        return (self.current_share_price()*self.shares).quantize(Decimal('1.00'))
+
+    def current_profit(self):
+        return self.current_value() - self.purchase_value + self.realized_profits
 
     def current_share_price(self):
         return get_price(self.current_date)
 
     def deposit(self, amount):
+        print("  adding to depot: %s" % amount)
         assert not amount.is_signed()
         self.depot_value += amount
-
-    def deduct_tax(self, amount):
-        assert amount <= self.depot_value
-        self.depot_value -= amount
+        self.total_deposited += amount
 
     def buy_shares(self, count):
         assert count >= 0
@@ -186,20 +153,159 @@ class FundAccount:
         assert self.depot_value >= purchase_amount
         self.shares += count
         self.depot_value -= purchase_amount
+        self.purchase_value += purchase_amount
+
+    def sell_shares(self, count):
+        assert count >= 0
+        assert count <= self.shares
+        sell_amount = (self.current_share_price()*count).quantize(Decimal('1.00'))
+
+        purchase_price = self.purchase_value / self.shares
+        partial_purchase_value = purchase_price*count
+        self.realized_profits += (sell_amount - partial_purchase_value).quantize(Decimal('1.00'))
+
+        self.shares -= count
+        self.depot_value += sell_amount
+        self.purchase_value -= partial_purchase_value
+
+    def _enter_month(self, month):
+        if not self.due_tax_deduction.is_zero():
+            print("  deducting tax: %s (%s available in depot)" % (self.due_tax_deduction, self.depot_value))
+        assert self.due_tax_deduction <= self.depot_value
+        assert not self.due_tax_deduction.is_signed()
+        self.depot_value -= self.due_tax_deduction
+        self.due_tax_deduction = Decimal(0)
+
+class DirectFundAccount(BasicFundAccount):
+    def __init__(self, open_date):
+        BasicFundAccount.__init__(self, open_date)
+        self.pending_tax_next_year = Decimal(0)
+
+    def _enter_month(self, month):
+        super()._enter_month(month)
+        if month == 1:
+            assert self.due_tax_deduction.is_zero()
+            self.due_tax_deduction = self.pending_tax_next_year
+
+            standard_income = self.current_value() * Decimal('0.004')
+            pending_tax_next = standard_income * Decimal('0.3')
+            pending_tax_next = pending_tax_next.quantize(Decimal('1.00'))
+            print("Standard income tax next year: %s" % pending_tax_next)
+            self.pending_tax_next_year = pending_tax_next
+
+
+class InsuranceFundAccount(BasicFundAccount):
+    def __init__(self, open_date):
+        BasicFundAccount.__init__(self, open_date)
+        self.amount_at_year_start = Decimal(0)
+        self.year_deposit_first_half = Decimal(0)
+        self.year_deposit_second_half = Decimal(0)
+        self.tax_deducted_so_far = Decimal(0)
+
+    def _enter_month(self, month):
+        super()._enter_month(month)
+        previous_amount_at_year_start = self.amount_at_year_start
+        if month == 1:
+            self.amount_at_year_start = self.current_value()
+            print("Amount at start of %s: %s" % (self.current_date.year, self.amount_at_year_start))
+
+        # > När dras avkastningsskatten?
+        # > Den dras 4 ggr om året, i januari, april, juli och oktober.
+        if month in (1, 4, 7, 10):
+            # Predict how much tax we are going to pay at end of this year
+            taxation_year = self.current_date.year
+            if month == 1:
+                taxation_year -= 1
+            print('  Tax deduction calculation:')
+            slr_date = date(taxation_year - 1, 11, 30)
+            slr = get_slr(slr_date)
+            slr_factor = slr + Decimal('0.01')
+            if slr_factor < Decimal('0.0125'):
+                slr_factor = Decimal('0.0125')
+            print('    SLR factor: %s' % slr_factor)
+            base_taxation_fund_amount = previous_amount_at_year_start
+            print('    Base fund amount: %s' % base_taxation_fund_amount)
+            taxation_deposits = self.year_deposit_first_half + self.year_deposit_second_half * Decimal(0.5)
+            print('    Added deposit amount: %s' % taxation_deposits)
+            taxation_fund_amount = base_taxation_fund_amount + taxation_deposits
+            tax = (taxation_fund_amount * slr_factor * Decimal('0.3')).quantize(Decimal('1.00'))
+            print("    Predicted tax at end of year: %s" % tax)
+
+            # Make sure we have deducted at least a proportion of the predicted tax
+            # that corresponds to the how many months have gone on the current
+            # taxation year.
+            if month == 1:
+                due_tax_factor = Decimal('1.0')
+            elif month == 10:
+                due_tax_factor = Decimal('0.75')
+            elif month == 7:
+                due_tax_factor = Decimal('0.5')
+            elif month == 4:
+                due_tax_factor = Decimal('0.25')
+
+            total_due_now = (tax * due_tax_factor).quantize(Decimal('1.00'))
+            self.due_tax_deduction = total_due_now - self.tax_deducted_so_far
+            self.tax_deducted_so_far += self.due_tax_deduction
+            print("    Deduct now: %s" % self.due_tax_deduction)
+            print("    Accumulated: %s" % self.tax_deducted_so_far)
+            assert not self.due_tax_deduction.is_signed()
+
+            if month == 1:
+                self.year_deposit_first_half = Decimal(0)
+                self.year_deposit_second_half = Decimal(0)
+                self.tax_deducted_so_far = Decimal(0)
+
+def simulate_mortgage(loan_amount, interest_rate, date_start, years, amortization):
+    amortization = amortization.quantize(Decimal('1.00'))
+    mortgage = Mortgage(loan_amount, interest_rate)
+
+    csvfile = open('mortgage.csv', 'w', newline='')
+    writer = csv.writer(csvfile)
+    writer.writerow([
+        'Date',
+        'Interest',
+        'Debt',
+        'Total paid interest',
+        'Total amortization',
+        'Total paid',
+        'Balance'
+    ])
+
+    current_date = date(year=date_start.year, month=date_start.month, day=25)
+    date_end = date_start + relativedelta(years=years)
+    total_paid_interest = Decimal(0)
+    total_paid_amortization = Decimal(0)
+    while current_date < date_end:
+        monthly_interest = mortgage.monthly_interest()
+        mortgage.amortize(amortization)
+        total_paid_interest += monthly_interest
+        total_paid_amortization += amortization
+        total_paid = total_paid_interest + total_paid_amortization
+
+        row = [
+            current_date,
+            monthly_interest,
+            mortgage.amount,
+            total_paid_interest,
+            total_paid_amortization,
+            total_paid,
+            -mortgage.amount - total_paid
+        ]
+
+        writer.writerow(row)
+        current_date += relativedelta(months=1)
+
+    csvfile.close()
 
 
 def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_amortization):
-    account = FundAccount(date_start)
+    account = DirectFundAccount(date_start)
     faux_mortgage = Mortgage(loan_amount, interest_rate)
     faux_amortization = faux_amortization.quantize(Decimal('1.00'))
-    actual_monthly_interest = loan_amount * interest_rate / Decimal(12)
+    actual_mortgage = Mortgage(loan_amount, interest_rate)
 
     end_date = date_start + relativedelta(years=years)
 
-    pending_tax_next = Decimal(0)
-    pending_tax_current = Decimal(0)
-
-    total_fund_deposit = Decimal(0)
     total_paid_interest = Decimal(0)
     total_paid_tax = Decimal(0)
 
@@ -211,52 +317,32 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
         'Deposit adjustment',
         'Deposit',
         'Fund value',
+        'Value after selling',
         'Total paid interest',
         'Total paid tax',
         'Total fund deposits',
         'Total paid',
-        'Capital minus total paid',
+        'Profit',
+        'Profit tax',
+        'Balance',
+        'Remaining after repaying mortgage',
         'Shares'
     ])
 
     while account.current_date < end_date:
-        if account.current_date.month == 1 and account.current_date.day == 1:
-            assert pending_tax_next.is_zero()
-            standard_income = account.current_value() * Decimal('0.004')
-            pending_tax_next = standard_income * Decimal('0.3')
-            pending_tax_next = pending_tax_next.quantize(Decimal('1.00'))
-            print("Standard income tax next year: %s" % pending_tax_next)
-
         account.move_forward_to_day(25)
-        row = []
         print(account.current_date)
-        row.append(account.current_date)
 
-        if account.current_date.month == 4:
-            if not pending_tax_current.is_zero():
-                print("  paying tax: %s" % pending_tax_current)
-                print("    (current depot value: %s)" % account.depot_value)
-                account.deduct_tax(pending_tax_current)
-                total_paid_tax += pending_tax_current
-            pending_tax_current = pending_tax_next
-            pending_tax_next = Decimal(0)
-
-        faux_monthly_interest = faux_mortgage.monthly_interest()
-        row.append(faux_monthly_interest)
-        faux_mortgage.amortize(faux_amortization)
-        deposit_adjustment = actual_monthly_interest - faux_monthly_interest
-        row.append(deposit_adjustment)
+        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
         deposit = faux_amortization - deposit_adjustment
         account.deposit(deposit)
-        row.append(deposit)
-        print("  deposit: %s" % deposit)
+        save_for_tax = max(account.pending_tax_next_year, account.due_tax_deduction)
         print("  depot value: %s" % account.depot_value)
-        print("    (saving %s for tax)" % pending_tax_current)
+        print("    (saving %s for tax)" % save_for_tax)
         print("  current share price: %s" % account.current_share_price())
 
-
         available_for_purchase = account.depot_value
-        available_for_purchase -= pending_tax_current
+        available_for_purchase -= save_for_tax
         if not available_for_purchase.is_signed():
             shares_to_buy = available_for_purchase/account.current_share_price()
             shares_to_buy = shares_to_buy.to_integral_value(rounding=decimal.ROUND_FLOOR)
@@ -264,43 +350,47 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
             print("  buy %s shares" % shares_to_buy)
             print("  fund value: %s" % account.current_value())
 
-        row.append(account.current_value())
+        total_paid_interest += actual_mortgage.monthly_interest()
+        total_paid = total_paid_interest + account.total_deposited
+        total_paid_tax += account.due_tax_deduction
 
-        total_paid_interest += actual_monthly_interest
-        row.append(total_paid_interest)
-        row.append(total_paid_tax)
-        total_fund_deposit += deposit
-        row.append(total_fund_deposit)
-        total_paid = total_paid_interest + total_fund_deposit
-        row.append(total_paid)
+        profit = account.current_profit()
+        profit_tax = profit*Decimal('0.3').quantize(Decimal('1.00'))
+        value_after_selling = account.current_value() - profit_tax
 
-        row.append(account.current_value() - loan_amount - total_paid)
-        row.append(account.shares)
-
+        row = [
+            account.current_date,
+            faux_mortgage.monthly_interest(),
+            deposit_adjustment,
+            deposit,
+            account.current_value(),
+            value_after_selling,
+            total_paid_interest,
+            total_paid_tax,
+            account.total_deposited,
+            total_paid,
+            profit,
+            profit_tax,
+            value_after_selling - total_paid_interest - loan_amount,
+            value_after_selling - loan_amount,
+            account.shares
+        ]
         writer.writerow(row)
+
+        faux_mortgage.amortize(faux_amortization)
         account.next_month()
+
     csvfile.close()
 
-
-
-def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
+def simulate_kf(loan_amount, interest_rate, date_start, years, faux_amortization):
+    account = InsuranceFundAccount(date_start)
+    actual_mortgage = Mortgage(loan_amount, interest_rate)
+    faux_mortgage = Mortgage(loan_amount, interest_rate)
     faux_amortization = faux_amortization.quantize(Decimal('1.00'))
-    actual_interest_amount = loan_amount * interest / Decimal(12)
-    fund_shares = 0
-    depot_value = Decimal(0)
     total_paid_interest = Decimal(0)
     total_paid_tax = Decimal(0)
-    total_fund_deposits = Decimal(0)
-    paid_amortization = Decimal(0)
 
-    current_year = date_start.year
-    current_date = date(year=date_start.year, month=date_start.month, day=25)
     date_end = date_start + relativedelta(years=years)
-
-    fund_amount_at_year_start = {current_year: Decimal(0)}
-    fund_deposits_first_half = Decimal(0)
-    fund_deposits_second_half = Decimal(0)
-    running_tax_deduction = Decimal(0)
 
     #rows = []
     csvfile = open('kf.csv', 'w', newline='')
@@ -308,141 +398,63 @@ def simulate_kf(loan_amount, interest, date_start, years, faux_amortization):
     writer.writerow([
         'Date',
         'Faux interest',
-        'Deposit adjustment',
         'Deposit',
         'Fund value',
+        'Fund profit',
         'Total paid interest',
         'Total paid tax',
         'Total fund deposits',
         'Total paid',
-        'Capital minus total paid'
+        'Balance',
+        'Remaining after repaying mortgage',
+        'Shares'
     ])
-    while current_date < date_end:
-        print("%s:" % current_date)
-        row = []
-        row.append(current_date)
+    while account.current_date < date_end:
+        account.move_forward_to_day(25)
+        print("%s:" % account.current_date)
+        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
+        depot_deposit = faux_amortization - deposit_adjustment
+        account.deposit(depot_deposit)
 
-        if current_year != current_date.year:
-            # Record fund value at start of year and reset accumulation of
-            # fund deposits by year half (for taxation calculations)
-            current_year = current_date.year
-            share_price_at_year_start = get_price(date(current_year, 1, 1))
-            fund_amount = (share_price_at_year_start*fund_shares + depot_value).quantize(Decimal('1.00'))
-            print("Fund at start of %d: %s" % (current_year, fund_amount))
-            fund_amount_at_year_start[current_year] = fund_amount
-
-        tax_deduction_due_now = Decimal(0)
-        # > När dras avkastningsskatten?
-        # > Den dras 4 ggr om året, i januari, april, juli och oktober.
-        if current_date.month in (1, 4, 7, 10):
-            # Predict how much tax we are going to pay at end of this year
-            taxation_year = current_year
-            if current_date.month == 1:
-                taxation_year -= 1
-            print('  Tax deduction calculation:')
-            slr_date = date(taxation_year - 1, 11, 30)
-            slr = get_slr(slr_date)
-            slr_factor = slr + Decimal('0.01')
-            if slr_factor < Decimal('0.0125'):
-                slr_factor = Decimal('0.0125')
-            print('    SLR factor: %s' % slr_factor)
-            base_taxation_fund_amount = fund_amount_at_year_start[taxation_year]
-            print('    Base fund amount: %s' % base_taxation_fund_amount)
-            taxation_deposits = fund_deposits_first_half + fund_deposits_second_half * Decimal(0.5)
-            print('    Added deposit amount: %s' % taxation_deposits)
-            taxation_fund_amount = base_taxation_fund_amount + taxation_deposits
-            tax = (taxation_fund_amount * slr_factor * Decimal('0.3')).quantize(Decimal('1.00'))
-            print("    Predicted tax at end of year: %s" % tax)
-
-            # Make sure we have deducted at least a proportion of the predicted tax
-            # that corresponds to the how many months have gone on the current
-            # taxation year.
-            if current_date.month == 1:
-                due_tax_factor = Decimal('1.0')
-            elif current_date.month == 10:
-                due_tax_factor = Decimal('0.75')
-            elif current_date.month == 7:
-                due_tax_factor = Decimal('0.5')
-            elif current_date.month == 4:
-                due_tax_factor = Decimal('0.25')
-
-            total_due_now = (tax * due_tax_factor).quantize(Decimal('1.00'))
-            tax_deduction_due_now = total_due_now - running_tax_deduction
-            assert not tax_deduction_due_now.is_signed()
-            print("    Deduct now: %s" % tax_deduction_due_now)
-            print("    Accumulated: %s" % (running_tax_deduction + tax_deduction_due_now))
-            running_tax_deduction += tax_deduction_due_now
-
-            if current_date.month == 1:
-                fund_deposits_first_half = Decimal(0)
-                fund_deposits_second_half = Decimal(0)
-                running_tax_deduction = Decimal(0)
-
-        current_share_price = get_price(current_date)
-
-        faux_interest_amount = (loan_amount*interest/Decimal(12)).quantize(Decimal('1.00'))
-        deposit_adjustment = faux_interest_amount - actual_interest_amount
-        # NEXT add funds to depot instead and then use depot value for any decisions made
-        depot_deposit = faux_amortization + deposit_adjustment
-        depot_value += depot_deposit
-
-        if current_date.month < 7:
-            fund_deposits_first_half += depot_deposit
-        else:
-            fund_deposits_second_half += depot_deposit
-
-        #fund_deposit = faux_amortization + deposit_adjustment - tax_deduction_due_now
-        print("  Adding to depot: %s" % depot_deposit)
-
-        if tax_deduction_due_now > depot_value:
+        if account.due_tax_deduction > account.depot_value:
             # Not enough money in depot. Need to sell off shares.
-            extra_needed_money = tax_deduction_due_now - depot_value
-            shares_to_sell = extra_needed_money / current_share_price
+            extra_needed_money = account.due_tax_deduction - account.depot_value
+            shares_to_sell = extra_needed_money / account.current_share_price()
             shares_to_sell = shares_to_sell.to_integral_value(rounding=decimal.ROUND_CEILING)
-            fund_shares -= shares_to_sell
-            sold_shares_value = (shares_to_sell*current_share_price).quantize(Decimal('1.00'))
-            depot_value += sold_shares_value
-            print("  Sell %s shares for %s to pay for tax; depot value now %s" % (shares_to_sell, sold_shares_value, depot_value))
+            account.sell_shares(shares_to_sell)
+            print("  Sell %s shares to pay for tax; depot value now %s" % (shares_to_sell, account.depot_value))
 
-        if not tax_deduction_due_now.is_zero():
-            depot_value -= tax_deduction_due_now
-            print("  Deducting tax from depot; value now %s" % depot_value)
-
-        shares_to_buy = depot_value/current_share_price
+        available_for_purchase = account.depot_value - account.due_tax_deduction
+        shares_to_buy = available_for_purchase/account.current_share_price()
         shares_to_buy = shares_to_buy.to_integral_value(rounding=decimal.ROUND_FLOOR)
-        purchase_value = (shares_to_buy*current_share_price).quantize(Decimal('1.00'))
         if not shares_to_buy.is_zero():
-            fund_shares += shares_to_buy
-            depot_value -= purchase_value
-            print("  Buy %s shares for %s" % (shares_to_buy, purchase_value))
-            print("  Depot value: %s" % depot_value)
+            account.buy_shares(shares_to_buy)
+            print("  Buy %s shares" % shares_to_buy)
+            print("  Depot value: %s" % account.depot_value)
 
-        new_fund_value = (fund_shares*current_share_price).quantize(Decimal('1.00'))
+        print("  Fund value after transactions: %s" % account.current_value())
+        total_paid_interest += actual_mortgage.monthly_interest()
+        total_paid = total_paid_interest + account.total_deposited
+        total_paid_tax += account.due_tax_deduction
 
-        loan_amount -= faux_amortization
-        paid_amortization += faux_amortization
-
-        row.append(faux_interest_amount)
-        row.append(deposit_adjustment)
-        row.append(depot_deposit)
-        row.append(new_fund_value)
-        print("  Fund value after transactions: %s" % new_fund_value)
-        print("  Depot value: %s" % depot_value)
-
-        total_paid_interest += actual_interest_amount
-        row.append(total_paid_interest)
-        total_paid_tax += tax_deduction_due_now
-        row.append(total_paid_tax)
-        total_fund_deposits += depot_deposit
-        # TODO probably need to track paid tax here also
-        row.append(total_fund_deposits)
-        total_paid = total_paid_interest + total_fund_deposits
-        row.append(total_paid)
-        row.append(new_fund_value - total_paid - loan_amount)
+        row = [
+            account.current_date,
+            faux_mortgage.monthly_interest(),
+            depot_deposit,
+            account.current_value(),
+            account.current_profit(),
+            total_paid_interest,
+            total_paid_tax,
+            account.total_deposited,
+            total_paid,
+            account.current_value() - total_paid_interest - loan_amount,
+            account.current_value() - loan_amount,
+            account.shares
+        ]
         writer.writerow(row)
 
-        previous_row_date = current_date
-        current_date += relativedelta(months=1)
+        faux_mortgage.amortize(faux_amortization)
+        account.next_month()
 
     csvfile.close()
 
