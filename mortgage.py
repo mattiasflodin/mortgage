@@ -103,6 +103,14 @@ class Mortgage:
     def monthly_interest(self):
         return (self.amount * self.interest_rate/Decimal(12)).quantize(Decimal('1.00'))
 
+    # This is broken since tax depends on yearly interest expenses and we don't
+    # know how to compute the amount of interest paid for the entire year.
+    # But for the current simulation we can ignore that since we're never
+    # paying more than 100,000 sek / year.
+    def monthly_interest_after_tax_deduction(self):
+        yearly_interest = (self.amount * self.interest_rate)*Decimal('0.7')
+        return (yearly_interest/Decimal(12)).quantize(Decimal('1.00'))
+
     def clone(self):
         return Mortgage(self.amount, self.interest_rate)
 
@@ -279,7 +287,7 @@ def simulate_mortgage(loan_amount, interest_rate, date_start, years, amortizatio
     total_paid_interest = Decimal(0)
     total_paid_amortization = Decimal(0)
     while current_date < date_end:
-        monthly_interest = mortgage.monthly_interest()
+        monthly_interest = mortgage.monthly_interest_after_tax_deduction()
         mortgage.amortize(amortization)
         total_paid_interest += monthly_interest
         total_paid_amortization += amortization
@@ -308,7 +316,8 @@ def predict_deposits_until_january(actual_mortgage, faux_mortgage, current_month
         return deposit_sum
     #print("  predict:")
     while current_month != 13:
-        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
+        deposit_adjustment = actual_mortgage.monthly_interest_after_tax_deduction() - \
+            faux_mortgage.monthly_interest_after_tax_deduction()
         deposit = amortization - deposit_adjustment
         #print("    %s %s" % (current_month, deposit))
         deposit_sum += deposit
@@ -333,7 +342,6 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
     writer.writerow([
         'Date',
         'Faux interest',
-        'Deposit adjustment',
         'Deposit',
         'Fund value',
         'Value after selling',
@@ -352,10 +360,9 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
         account.move_forward_to_day(25)
         print(account.current_date)
 
-        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
-        deposit = faux_amortization - deposit_adjustment
+        deposit = faux_mortgage.monthly_interest_after_tax_deduction() + faux_amortization
+        deposit -= actual_mortgage.monthly_interest_after_tax_deduction()
         account.deposit(deposit)
-        #save_for_tax = max(account.pending_tax_next_year, account.due_tax_deduction)
 
         deposits_before_january = predict_deposits_until_january(actual_mortgage, faux_mortgage,
             account.current_date.month, faux_amortization)
@@ -377,7 +384,7 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
             print("  buy %s shares" % shares_to_buy)
             print("  fund value: %s" % account.current_value())
 
-        total_paid_interest += actual_mortgage.monthly_interest()
+        total_paid_interest += actual_mortgage.monthly_interest_after_tax_deduction()
         total_paid = total_paid_interest + account.total_deposited
         total_paid_tax += account.due_tax_deduction
 
@@ -387,8 +394,7 @@ def simulate_fund_account(loan_amount, interest_rate, date_start, years, faux_am
 
         row = [
             account.current_date,
-            faux_mortgage.monthly_interest(),
-            deposit_adjustment,
+            faux_mortgage.monthly_interest_after_tax_deduction(),
             deposit,
             account.current_value(),
             value_after_selling,
@@ -439,9 +445,10 @@ def simulate_kf(loan_amount, interest_rate, date_start, years, faux_amortization
     while account.current_date < date_end:
         account.move_forward_to_day(25)
         print("%s:" % account.current_date)
-        deposit_adjustment = actual_mortgage.monthly_interest() - faux_mortgage.monthly_interest()
-        depot_deposit = faux_amortization - deposit_adjustment
-        account.deposit(depot_deposit)
+        deposit = faux_mortgage.monthly_interest_after_tax_deduction() + faux_amortization
+        print("  would have paid %s to mortgage" % deposit)
+        deposit -= actual_mortgage.monthly_interest_after_tax_deduction()
+        account.deposit(deposit)
 
         if account.due_tax_deduction > account.depot_value:
             # Not enough money in depot. Need to sell off shares.
@@ -460,14 +467,14 @@ def simulate_kf(loan_amount, interest_rate, date_start, years, faux_amortization
             print("  Depot value: %s" % account.depot_value)
 
         print("  Fund value after transactions: %s" % account.current_value())
-        total_paid_interest += actual_mortgage.monthly_interest()
+        total_paid_interest += actual_mortgage.monthly_interest_after_tax_deduction()
         total_paid = total_paid_interest + account.total_deposited
         total_paid_tax += account.due_tax_deduction
 
         row = [
             account.current_date,
-            faux_mortgage.monthly_interest(),
-            depot_deposit,
+            faux_mortgage.monthly_interest_after_tax_deduction(),
+            deposit,
             account.current_value(),
             account.current_profit(),
             total_paid_interest,
